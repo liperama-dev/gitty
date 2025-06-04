@@ -1,0 +1,779 @@
+#!/usr/bin/env zsh
+
+# Gitty - Multi-Account Git CLI Tool
+# Makes switching between GitHub accounts seamless
+
+set -e
+
+# Color codes for pretty output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+PURPLE='\033[0;35m'
+CYAN='\033[0;36m'
+NC='\033[0m' # No Color
+
+# Load saved accounts from config file
+load_saved_accounts() {
+    local config_file="$HOME/.gitty_accounts"
+    
+    if [[ -f "$config_file" ]]; then
+        while IFS='=' read -r account config_line; do
+            # Skip empty lines and comments
+            [[ -z "$account" || "$account" =~ ^# ]] && continue
+            ACCOUNTS[$account]="$config_line"
+        done < "$config_file"
+    fi
+}
+
+# Account configurations
+declare -A ACCOUNTS
+ACCOUNTS[futugora]="Futugora:liperama@futugora.net:github-futugora"
+ACCOUNTS[liperama-dev]="Phillipe Ramalho:ramalhophillipe@gmail.com:github.com"
+
+# Load any additional saved accounts
+load_saved_accounts
+
+# Helper functions
+print_success() {
+    echo -e "${GREEN}✅ $1${NC}"
+}
+
+print_error() {
+    echo -e "${RED}❌ $1${NC}"
+}
+
+print_warning() {
+    echo -e "${YELLOW}⚠️  $1${NC}"
+}
+
+print_info() {
+    echo -e "${BLUE}ℹ️  $1${NC}"
+}
+
+print_header() {
+    echo -e "${PURPLE}🚀 Gitty - Multi-Account Git Manager${NC}"
+    echo ""
+}
+
+# Check if we're in a git repository
+check_git_repo() {
+    if ! git rev-parse --git-dir > /dev/null 2>&1; then
+        print_error "Not in a git repository. Run 'git init' first."
+        exit 1
+    fi
+}
+
+# Get current git user
+get_current_user() {
+    local name=$(git config user.name 2>/dev/null || echo "None")
+    local email=$(git config user.email 2>/dev/null || echo "None")
+    echo "$name <$email>"
+}
+
+# Get current remote origin
+get_current_remote() {
+    git remote get-url origin 2>/dev/null || echo "None"
+}
+
+# SSH key management functions
+generate_ssh_key() {
+    local account=$1
+    local email=$2
+    local key_path="$HOME/.ssh/id_ed25519_${account}"
+    
+    # Check if key already exists
+    if [[ -f "$key_path" ]]; then
+        print_warning "SSH key already exists for account '$account'"
+        print_info "Key location: $key_path"
+        echo -n "Regenerate the key? This will overwrite the existing key (y/N): "
+        read -r response
+        if [[ ! "$response" =~ ^[Yy]$ ]]; then
+            print_info "Keeping existing key"
+            return 0
+        fi
+    fi
+    
+    print_info "Generating SSH key for account '$account'..."
+    
+    # Generate the SSH key
+    if ssh-keygen -t ed25519 -C "$email" -f "$key_path" -N ""; then
+        print_success "SSH key generated successfully!"
+        print_info "Private key: $key_path"
+        print_info "Public key: ${key_path}.pub"
+    else
+        print_error "Failed to generate SSH key"
+        return 1
+    fi
+    
+    # Set proper permissions
+    chmod 600 "$key_path"
+    chmod 644 "${key_path}.pub"
+    
+    return 0
+}
+
+setup_ssh_config() {
+    local account=$1
+    local ssh_host=$2
+    local key_path="$HOME/.ssh/id_ed25519_${account}"
+    local ssh_config="$HOME/.ssh/config"
+    
+    # Create .ssh directory if it doesn't exist
+    mkdir -p "$HOME/.ssh"
+    chmod 700 "$HOME/.ssh"
+    
+    # Create SSH config if it doesn't exist
+    if [[ ! -f "$ssh_config" ]]; then
+        touch "$ssh_config"
+        chmod 600 "$ssh_config"
+    fi
+    
+    # Check if host already exists in config
+    if grep -q "^Host $ssh_host$" "$ssh_config"; then
+        print_warning "SSH config entry for '$ssh_host' already exists"
+        echo -n "Update it? (y/N): "
+        read -r response
+        if [[ ! "$response" =~ ^[Yy]$ ]]; then
+            print_info "Keeping existing SSH config"
+            return 0
+        fi
+        
+        # Remove existing entry
+        sed -i.bak "/^Host $ssh_host$/,/^$/d" "$ssh_config"
+    fi
+    
+    # Add new SSH config entry
+    cat >> "$ssh_config" << EOF
+
+Host $ssh_host
+  HostName github.com
+  User git
+  IdentityFile $key_path
+  AddKeysToAgent yes
+  UseKeychain yes
+EOF
+    
+    print_success "SSH config updated!"
+    print_info "Added entry for '$ssh_host' using key '$key_path'"
+}
+
+copy_public_key() {
+    local account=$1
+    local key_path="$HOME/.ssh/id_ed25519_${account}.pub"
+    
+    if [[ ! -f "$key_path" ]]; then
+        print_error "Public key not found: $key_path"
+        return 1
+    fi
+    
+    # Copy to clipboard (macOS)
+    if command -v pbcopy > /dev/null; then
+        cat "$key_path" | pbcopy
+        print_success "Public key copied to clipboard!"
+    else
+        print_info "Public key content:"
+        echo ""
+        cat "$key_path"
+        echo ""
+    fi
+    
+    print_info "Add this key to your GitHub account:"
+    print_info "1. Go to https://github.com/settings/keys"
+    print_info "2. Click 'New SSH key'"
+    print_info "3. Give it a title like '$account'"
+    print_info "4. Paste the key and save"
+}
+
+ssh_management() {
+    local action=$1
+    local account=$2
+    
+    case "$action" in
+        "generate"|"gen")
+            if [[ -z "$account" ]]; then
+                print_error "Please specify an account"
+                echo "Usage: gitty ssh generate <account>"
+                exit 1
+            fi
+            
+            if [[ -z "${ACCOUNTS[$account]}" ]]; then
+                print_error "Account '$account' not found"
+                print_info "Available accounts: ${(k)ACCOUNTS}"
+                exit 1
+            fi
+            
+            # Parse account info to get email
+            local IFS=":"
+            local info=(${=ACCOUNTS[$account]})
+            local email=$info[2]
+            
+            generate_ssh_key "$account" "$email"
+            ;;
+            
+        "config")
+            if [[ -z "$account" ]]; then
+                print_error "Please specify an account"
+                echo "Usage: gitty ssh config <account>"
+                exit 1
+            fi
+            
+            if [[ -z "${ACCOUNTS[$account]}" ]]; then
+                print_error "Account '$account' not found"
+                print_info "Available accounts: ${(k)ACCOUNTS}"
+                exit 1
+            fi
+            
+            # Parse account info to get SSH host
+            local IFS=":"
+            local info=(${=ACCOUNTS[$account]})
+            local ssh_host=$info[3]
+            
+            setup_ssh_config "$account" "$ssh_host"
+            ;;
+            
+        "copy")
+            if [[ -z "$account" ]]; then
+                print_error "Please specify an account"
+                echo "Usage: gitty ssh copy <account>"
+                exit 1
+            fi
+            
+            copy_public_key "$account"
+            ;;
+            
+        "setup")
+            if [[ -z "$account" ]]; then
+                print_error "Please specify an account"
+                echo "Usage: gitty ssh setup <account>"
+                exit 1
+            fi
+            
+            if [[ -z "${ACCOUNTS[$account]}" ]]; then
+                print_error "Account '$account' not found"
+                print_info "Available accounts: ${(k)ACCOUNTS}"
+                exit 1
+            fi
+            
+            # Parse account info
+            local IFS=":"
+            local info=(${=ACCOUNTS[$account]})
+            local email=$info[2]
+            local ssh_host=$info[3]
+            
+            print_info "Setting up SSH for account '$account'..."
+            
+            if generate_ssh_key "$account" "$email"; then
+                if [[ "$ssh_host" != "github.com" ]]; then
+                    setup_ssh_config "$account" "$ssh_host"
+                fi
+                copy_public_key "$account"
+            fi
+            ;;
+            
+        *)
+            print_header
+            echo -e "${CYAN}SSH Key Management:${NC}"
+            echo "  gitty ssh setup <account>     Complete SSH setup (generate + config + copy)"
+            echo "  gitty ssh generate <account>  Generate SSH key pair"
+            echo "  gitty ssh config <account>    Setup SSH config entry"
+            echo "  gitty ssh copy <account>      Copy public key to clipboard"
+            echo ""
+            echo -e "${CYAN}Examples:${NC}"
+            echo "  gitty ssh setup mycompany     # Complete setup"
+            echo "  gitty ssh generate personal   # Just generate keys"
+            echo "  gitty ssh copy work           # Copy public key"
+            ;;
+    esac
+}
+
+# Register new account function
+register_account() {
+    local account=$1
+    
+    print_info "Account '$account' not found. Let's set it up!"
+    echo ""
+    
+    # Get display name
+    echo -n "Enter your display name (e.g., 'John Doe'): "
+    read -r display_name
+    
+    if [[ -z "$display_name" ]]; then
+        print_error "Display name cannot be empty"
+        exit 1
+    fi
+    
+    # Get email
+    echo -n "Enter your email address: "
+    read -r email
+    
+    if [[ -z "$email" ]]; then
+        print_error "Email cannot be empty"
+        exit 1
+    fi
+    
+    # Get SSH host
+    echo ""
+    print_info "SSH Host Configuration:"
+    echo "  Option 1: Use 'github.com' (standard)"
+    echo "  Option 2: Use a custom SSH host alias (recommended for multi-account)"
+    echo ""
+    echo -n "Enter SSH host (or press Enter for 'github.com'): "
+    read -r ssh_host
+    
+    if [[ -z "$ssh_host" ]]; then
+        ssh_host="github.com"
+    fi
+    
+    # Store the account configuration
+    local config_line="$display_name:$email:$ssh_host"
+    
+    # Add to runtime accounts
+    ACCOUNTS[$account]="$config_line"
+    
+    # Save to gitty config file
+    local config_file="$HOME/.gitty_accounts"
+    echo "$account=$config_line" >> "$config_file"
+    
+    print_success "Account '$account' registered successfully!"
+    print_info "Name: $display_name"
+    print_info "Email: $email"
+    print_info "SSH Host: $ssh_host"
+    echo ""
+    
+    # Offer to set up SSH keys
+    echo -n "Would you like to generate SSH keys for this account? (Y/n): "
+    read -r ssh_response
+    
+    if [[ ! "$ssh_response" =~ ^[Nn]$ ]]; then
+        print_info "Setting up SSH keys..."
+        
+        if generate_ssh_key "$account" "$email"; then
+            if [[ "$ssh_host" != "github.com" ]]; then
+                setup_ssh_config "$account" "$ssh_host"
+            fi
+            copy_public_key "$account"
+            
+            print_info "SSH setup complete! Remember to add the public key to your GitHub account."
+        else
+            print_warning "SSH key generation failed, but account is registered"
+        fi
+    else
+        if [[ "$ssh_host" != "github.com" ]]; then
+            print_warning "Don't forget to configure your SSH config (~/.ssh/config) for '$ssh_host'"
+            print_info "Example SSH config entry:"
+            echo ""
+            echo "Host $ssh_host"
+            echo "  HostName github.com"
+            echo "  User git"
+            echo "  IdentityFile ~/.ssh/id_ed25519_${account}"
+            echo ""
+        fi
+        print_info "You can run 'gitty ssh setup $account' later to generate SSH keys"
+    fi
+}
+
+# Update account function
+update_account() {
+    local account=$1
+    
+    if [[ -z "$account" ]]; then
+        print_error "Please specify an account to update"
+        echo "Usage: gitty update <account>"
+        exit 1
+    fi
+    
+    if [[ -z "${ACCOUNTS[$account]}" ]]; then
+        print_error "Account '$account' not found"
+        print_info "Available accounts: ${(k)ACCOUNTS}"
+        exit 1
+    fi
+    
+    # Parse current account info
+    local IFS=":"
+    local info=(${=ACCOUNTS[$account]})
+    local current_name=$info[1]
+    local current_email=$info[2]
+    local current_host=$info[3]
+    
+    print_info "Updating account '$account'"
+    print_info "Current settings:"
+    echo "  Name: $current_name"
+    echo "  Email: $current_email"
+    echo "  SSH Host: $current_host"
+    echo ""
+    
+    # Get new display name
+    echo -n "Enter new display name (or press Enter to keep '$current_name'): "
+    read -r new_name
+    if [[ -z "$new_name" ]]; then
+        new_name="$current_name"
+    fi
+    
+    # Get new email
+    echo -n "Enter new email address (or press Enter to keep '$current_email'): "
+    read -r new_email
+    if [[ -z "$new_email" ]]; then
+        new_email="$current_email"
+    fi
+    
+    # Get new SSH host
+    echo -n "Enter new SSH host (or press Enter to keep '$current_host'): "
+    read -r new_host
+    if [[ -z "$new_host" ]]; then
+        new_host="$current_host"
+    fi
+    
+    # Update the account configuration
+    local new_config_line="$new_name:$new_email:$new_host"
+    ACCOUNTS[$account]="$new_config_line"
+    
+    # Update the config file
+    local config_file="$HOME/.gitty_accounts"
+    
+    # Create a temporary file to store updated config
+    local temp_file=$(mktemp)
+    
+    # If config file exists, copy everything except the account we're updating
+    if [[ -f "$config_file" ]]; then
+        while IFS='=' read -r existing_account config_line; do
+            # Skip empty lines, comments, and the account we're updating
+            if [[ -n "$existing_account" && ! "$existing_account" =~ ^# && "$existing_account" != "$account" ]]; then
+                echo "$existing_account=$config_line" >> "$temp_file"
+            fi
+        done < "$config_file"
+    fi
+    
+    # Add the updated account
+    echo "$account=$new_config_line" >> "$temp_file"
+    
+    # Replace the config file
+    mv "$temp_file" "$config_file"
+    
+    print_success "Account '$account' updated successfully!"
+    print_info "New settings:"
+    echo "  Name: $new_name"
+    echo "  Email: $new_email"
+    echo "  SSH Host: $new_host"
+    
+    # If we're in a git repo and this is the current account, update git config
+    if git rev-parse --git-dir > /dev/null 2>&1; then
+        local current_account=$(git config gitty.account 2>/dev/null)
+        if [[ "$current_account" == "$account" ]]; then
+            git config user.name "$new_name"
+            git config user.email "$new_email"
+            print_info "Updated git config for current repository"
+        fi
+    fi
+}
+
+# Use account function
+use_account() {
+    local account=$1
+    
+    if [[ -z "${ACCOUNTS[$account]}" ]]; then
+        register_account "$account"
+    fi
+    
+    check_git_repo
+    
+    # Parse account info
+    local IFS=":"
+    local info=(${=ACCOUNTS[$account]})
+    local name=$info[1]
+    local email=$info[2]
+    local host=$info[3]
+    
+    # Set git config for this repository
+    git config user.name "$name"
+    git config user.email "$email"
+    
+    print_success "Switched to account: $account"
+    print_info "Name: $name"
+    print_info "Email: $email"
+    print_info "SSH Host: $host"
+    
+    # Store current account for connect command
+    git config gitty.account "$account"
+}
+
+# Connect project function
+connect_project() {
+    local project_name=$1
+    
+    if [[ -z "$project_name" ]]; then
+        print_error "Please provide a project name"
+        echo "Usage: gitty connect <project-name>"
+        exit 1
+    fi
+    
+    check_git_repo
+    
+    # Get current account
+    local current_account=$(git config gitty.account 2>/dev/null)
+    
+    if [[ -z "$current_account" ]]; then
+        print_error "No account set for this repository"
+        print_info "Run 'gitty use <account>' first"
+        exit 1
+    fi
+    
+    # Parse account info
+    local IFS=":"
+    local info=(${=ACCOUNTS[$current_account]})
+    local host=$info[3]
+    
+    # Determine the username for the remote URL
+    local username
+    if [[ "$current_account" == "futugora" ]]; then
+        username="futugora"
+    else
+        username="liperama-dev"
+    fi
+    
+    # Build remote URL
+    local remote_url="git@${host}:${username}/${project_name}.git"
+    
+    # Check if origin already exists
+    if git remote get-url origin > /dev/null 2>&1; then
+        print_warning "Origin remote already exists:"
+        print_info "Current: $(get_current_remote)"
+        echo ""
+        echo -n "Replace with $remote_url? (y/N): "
+        read -r response
+        if [[ "$response" =~ ^[Yy]$ ]]; then
+            git remote set-url origin "$remote_url"
+            print_success "Updated origin remote"
+        else
+            print_info "Cancelled"
+            exit 0
+        fi
+    else
+        git remote add origin "$remote_url"
+        print_success "Added origin remote"
+    fi
+    
+    print_info "Remote URL: $remote_url"
+    print_info "Account: $current_account"
+}
+
+# Status function
+show_status() {
+    print_header
+    
+    if ! git rev-parse --git-dir > /dev/null 2>&1; then
+        print_warning "Not in a git repository"
+        return
+    fi
+    
+    local current_user=$(get_current_user)
+    local current_remote=$(get_current_remote)
+    local current_account=$(git config gitty.account 2>/dev/null || echo "None")
+    
+    echo -e "${CYAN}Current Repository Status:${NC}"
+    echo "  User: $current_user"
+    echo "  Account: $current_account"
+    echo "  Remote: $current_remote"
+    echo ""
+    
+    echo -e "${CYAN}Available Accounts:${NC}"
+    for acc in "${(@k)ACCOUNTS}"; do
+        local IFS=":"
+        local info=(${=ACCOUNTS[$acc]})
+        local name=$info[1]
+        local email=$info[2]
+        
+        if [[ "$acc" == "$current_account" ]]; then
+            echo -e "  ${GREEN}● $acc${NC} - $name <$email>"
+        else
+            echo "  ○ $acc - $name <$email>"
+        fi
+    done
+}
+
+# Init function
+gitty_init() {
+    local branch_name="${1:-main}"
+    
+    # Check if we're already in a git repository
+    if git rev-parse --git-dir > /dev/null 2>&1; then
+        print_warning "Already in a git repository"
+        print_info "Current branch: $(git branch --show-current 2>/dev/null || echo 'detached HEAD')"
+        return
+    fi
+    
+    print_info "Initializing git repository with branch '$branch_name'..."
+    
+    # Initialize the repository
+    if git init; then
+        print_success "Initialized git repository"
+    else
+        print_error "Failed to initialize git repository"
+        exit 1
+    fi
+    
+    # Create initial commit to establish the branch
+    if [[ ! -f ".gitignore" ]]; then
+        echo "# Project files" > .gitignore
+        echo ".DS_Store" >> .gitignore
+        echo "node_modules/" >> .gitignore
+        echo "*.log" >> .gitignore
+        print_info "Created basic .gitignore file"
+    fi
+    
+    # Stage and commit
+    git add .gitignore
+    if git commit -m "Initial commit"; then
+        print_success "Created initial commit"
+    else
+        print_error "Failed to create initial commit"
+        exit 1
+    fi
+    
+    # Rename branch if not already 'main'
+    local current_branch=$(git branch --show-current)
+    if [[ "$current_branch" != "$branch_name" ]]; then
+        if git branch -m "$current_branch" "$branch_name"; then
+            print_success "Renamed default branch to '$branch_name'"
+        else
+            print_warning "Failed to rename branch, but repository is initialized"
+        fi
+    fi
+    
+    print_success "Repository initialized successfully!"
+    print_info "Default branch: $branch_name"
+    print_info "Ready for 'gitty use <account>' and 'gitty connect <project>'"
+}
+
+# Uncommit function
+uncommit_last() {
+    check_git_repo
+    
+    # Check if there are any commits to undo
+    if ! git rev-parse HEAD > /dev/null 2>&1; then
+        print_error "No commits found to undo"
+        exit 1
+    fi
+    
+    # Get the last commit message for confirmation
+    local last_commit=$(git log -1 --oneline 2>/dev/null)
+    
+    if [[ -z "$last_commit" ]]; then
+        print_error "Unable to get last commit information"
+        exit 1
+    fi
+    
+    print_warning "About to undo the last commit:"
+    print_info "$last_commit"
+    echo ""
+    echo -n "Continue? This will keep your files but unstage them (y/N): "
+    read -r response
+    
+    if [[ ! "$response" =~ ^[Yy]$ ]]; then
+        print_info "Cancelled"
+        exit 0
+    fi
+    
+    # Undo the last commit but keep files staged
+    if git reset --soft HEAD~; then
+        print_success "Undid last commit (files remain staged)"
+        
+        # Now unstage all files
+        if git reset; then
+            print_success "Unstaged all files"
+            print_info "Your changes are now in working directory (unstaged)"
+        else
+            print_warning "Commit undone but failed to unstage files"
+            print_info "Files remain staged - use 'git reset' to unstage them"
+        fi
+    else
+        print_error "Failed to undo last commit"
+        exit 1
+    fi
+}
+
+# Help function
+show_help() {
+    print_header
+    echo -e "${CYAN}Usage:${NC}"
+    echo "  gitty init [branch]        Initialize git repo with specified branch (default: main)"
+    echo "  gitty use <account>        Switch to account (registers new accounts automatically)"
+    echo "  gitty update <account>     Update account information (name, email, SSH host)"
+    echo "  gitty connect <project>    Connect to remote repository"
+    echo "  gitty ssh <action>         SSH key management (setup, generate, config, copy)"
+    echo "  gitty uncommit            Undo last commit and unstage files"
+    echo "  gitty status              Show current repository status"
+    echo "  gitty help                Show this help message"
+    echo ""
+    echo -e "${CYAN}Examples:${NC}"
+    echo "  gitty init                 # Initialize with 'main' branch"
+    echo "  gitty init develop         # Initialize with 'develop' branch"
+    echo "  gitty use futugora         # Switch to existing account"
+    echo "  gitty use mycompany        # Register & switch to new account"
+    echo "  gitty update liperama-dev  # Update account information"
+    echo "  gitty ssh setup mycompany  # Complete SSH setup for account"
+    echo "  gitty connect landing-page"
+    echo "  gitty uncommit"
+    echo ""
+    echo -e "${CYAN}Workflow:${NC}"
+    echo "  1. cd into your project directory"
+    echo "  2. gitty init [branch]     # Initialize with proper branch name"
+    echo "  3. gitty use <account>     # Registers account if new"
+    echo "  4. gitty connect <project-name>"
+    echo "  5. git push -u origin main"
+    echo ""
+    echo -e "${CYAN}SSH Commands:${NC}"
+    echo "  gitty ssh setup <account>     # Generate keys + config + copy to clipboard"
+    echo "  gitty ssh generate <account>  # Generate SSH key pair only"
+    echo "  gitty ssh config <account>    # Setup SSH config entry only"
+    echo "  gitty ssh copy <account>      # Copy public key to clipboard"
+    echo ""
+    echo -e "${CYAN}Account Registration:${NC}"
+    echo "  When you use 'gitty use <new_account>', you'll be prompted for:"
+    echo "  • Display name (e.g., 'John Doe')"
+    echo "  • Email address"
+    echo "  • SSH host (github.com or custom alias)"
+    echo "  • SSH key generation (optional)"
+    echo ""
+    echo -e "${CYAN}SSH Setup for Multiple Accounts:${NC}"
+    echo "  For best results, set up SSH host aliases in ~/.ssh/config:"
+    echo "  Host github-company"
+    echo "    HostName github.com"
+    echo "    User git"
+    echo "    IdentityFile ~/.ssh/id_ed25519_company"
+}
+
+# Main command parser
+case "${1:-help}" in
+    "init")
+        gitty_init "$2"
+        ;;
+    "use")
+        use_account "$2"
+        ;;
+    "update")
+        update_account "$2"
+        ;;
+    "connect")
+        connect_project "$2"
+        ;;
+    "ssh")
+        ssh_management "$2" "$3"
+        ;;
+    "uncommit")
+        uncommit_last
+        ;;
+    "status")
+        show_status
+        ;;
+    "help"|"-h"|"--help")
+        show_help
+        ;;
+    *)
+        print_error "Unknown command: $1"
+        echo ""
+        show_help
+        exit 1
+        ;;
+esac
