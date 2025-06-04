@@ -77,215 +77,72 @@ get_current_remote() {
     git remote get-url origin 2>/dev/null || echo "None"
 }
 
-# SSH key management functions
-generate_ssh_key() {
-    local account=$1
+# Check if GitHub CLI is installed
+check_gh_cli() {
+    command -v gh >/dev/null 2>&1
+}
+
+# Check if user is authenticated with GitHub CLI for a specific account
+is_gh_authenticated() {
+    local username=$1
+    
+    if ! check_gh_cli; then
+        return 1
+    fi
+    
+    # Check if the user is in the list of authenticated accounts
+    gh auth status 2>/dev/null | grep -q "account $username"
+}
+
+# Setup GitHub CLI authentication for an account
+setup_gh_auth() {
+    local username=$1
     local email=$2
-    local key_path="$HOME/.ssh/id_ed25519_${account}"
     
-    # Check if key already exists
-    if [[ -f "$key_path" ]]; then
-        print_warning "SSH key already exists for account '$account'"
-        print_info "Key location: $key_path"
-        echo -n "Regenerate the key? This will overwrite the existing key (y/N): "
-        read -r response
-        if [[ ! "$response" =~ ^[Yy]$ ]]; then
-            print_info "Keeping existing key"
-            return 0
-        fi
-    fi
-    
-    print_info "Generating SSH key for account '$account'..."
-    
-    # Generate the SSH key
-    if ssh-keygen -t ed25519 -C "$email" -f "$key_path" -N ""; then
-        print_success "SSH key generated successfully!"
-        print_info "Private key: $key_path"
-        print_info "Public key: ${key_path}.pub"
-    else
-        print_error "Failed to generate SSH key"
+    if ! check_gh_cli; then
+        print_warning "GitHub CLI (gh) not found"
+        print_info "Install it with: brew install gh"
+        print_info "This will enable automatic repository creation and management"
         return 1
     fi
     
-    # Set proper permissions
-    chmod 600 "$key_path"
-    chmod 644 "${key_path}.pub"
-    
-    return 0
-}
-
-setup_ssh_config() {
-    local account=$1
-    local ssh_host=$2
-    local key_path="$HOME/.ssh/id_ed25519_${account}"
-    local ssh_config="$HOME/.ssh/config"
-    
-    # Create .ssh directory if it doesn't exist
-    mkdir -p "$HOME/.ssh"
-    chmod 700 "$HOME/.ssh"
-    
-    # Create SSH config if it doesn't exist
-    if [[ ! -f "$ssh_config" ]]; then
-        touch "$ssh_config"
-        chmod 600 "$ssh_config"
-    fi
-    
-    # Check if host already exists in config
-    if grep -q "^Host $ssh_host$" "$ssh_config"; then
-        print_warning "SSH config entry for '$ssh_host' already exists"
-        echo -n "Update it? (y/N): "
-        read -r response
-        if [[ ! "$response" =~ ^[Yy]$ ]]; then
-            print_info "Keeping existing SSH config"
-            return 0
-        fi
+    if is_gh_authenticated "$username"; then
+        print_info "Already authenticated with GitHub CLI for $username"
         
-        # Remove existing entry
-        sed -i.bak "/^Host $ssh_host$/,/^$/d" "$ssh_config"
+        # Switch to this account if not already active
+        local current_user=$(gh api user --jq .login 2>/dev/null || echo "")
+        if [[ "$current_user" != "$username" ]]; then
+            print_info "Switching GitHub CLI to $username account..."
+            if gh auth switch --user "$username" 2>/dev/null; then
+                print_success "Switched GitHub CLI to $username"
+            else
+                print_warning "Failed to switch GitHub CLI account"
+            fi
+        fi
+        return 0
     fi
     
-    # Add new SSH config entry
-    cat >> "$ssh_config" << EOF
-
-Host $ssh_host
-  HostName github.com
-  User git
-  IdentityFile $key_path
-  AddKeysToAgent yes
-  UseKeychain yes
-EOF
+    print_info "Setting up GitHub CLI authentication for $username..."
+    print_warning "You'll be prompted to authenticate via browser"
+    echo ""
     
-    print_success "SSH config updated!"
-    print_info "Added entry for '$ssh_host' using key '$key_path'"
-}
-
-copy_public_key() {
-    local account=$1
-    local key_path="$HOME/.ssh/id_ed25519_${account}.pub"
-    
-    if [[ ! -f "$key_path" ]]; then
-        print_error "Public key not found: $key_path"
+    # Attempt to login
+    if gh auth login --git-protocol ssh --hostname github.com; then
+        print_success "GitHub CLI authentication completed"
+        
+        # Verify the authenticated user matches
+        local auth_user=$(gh api user --jq .login 2>/dev/null || echo "")
+        if [[ "$auth_user" == "$username" ]]; then
+            print_success "Authenticated as $username"
+        else
+            print_warning "Authenticated as $auth_user, but expected $username"
+            print_info "You may need to switch accounts with: gh auth switch --user $username"
+        fi
+        return 0
+    else
+        print_error "GitHub CLI authentication failed"
         return 1
     fi
-    
-    # Copy to clipboard (macOS)
-    if command -v pbcopy > /dev/null; then
-        cat "$key_path" | pbcopy
-        print_success "Public key copied to clipboard!"
-    else
-        print_info "Public key content:"
-        echo ""
-        cat "$key_path"
-        echo ""
-    fi
-    
-    print_info "Add this key to your GitHub account:"
-    print_info "1. Go to https://github.com/settings/keys"
-    print_info "2. Click 'New SSH key'"
-    print_info "3. Give it a title like '$account'"
-    print_info "4. Paste the key and save"
-}
-
-ssh_management() {
-    local action=$1
-    local account=$2
-    
-    case "$action" in
-        "generate"|"gen")
-            if [[ -z "$account" ]]; then
-                print_error "Please specify an account"
-                echo "Usage: gitty ssh generate <account>"
-                exit 1
-            fi
-            
-            if [[ -z "${ACCOUNTS[$account]}" ]]; then
-                print_error "Account '$account' not found"
-                print_info "Available accounts: ${(k)ACCOUNTS}"
-                exit 1
-            fi
-            
-            # Parse account info to get email
-            local IFS=":"
-            local info=(${=ACCOUNTS[$account]})
-            local email=$info[2]
-            
-            generate_ssh_key "$account" "$email"
-            ;;
-            
-        "config")
-            if [[ -z "$account" ]]; then
-                print_error "Please specify an account"
-                echo "Usage: gitty ssh config <account>"
-                exit 1
-            fi
-            
-            if [[ -z "${ACCOUNTS[$account]}" ]]; then
-                print_error "Account '$account' not found"
-                print_info "Available accounts: ${(k)ACCOUNTS}"
-                exit 1
-            fi
-            
-            # Parse account info to get SSH host
-            local IFS=":"
-            local info=(${=ACCOUNTS[$account]})
-            local ssh_host=$info[3]
-            
-            setup_ssh_config "$account" "$ssh_host"
-            ;;
-            
-        "copy")
-            if [[ -z "$account" ]]; then
-                print_error "Please specify an account"
-                echo "Usage: gitty ssh copy <account>"
-                exit 1
-            fi
-            
-            copy_public_key "$account"
-            ;;
-            
-        "setup")
-            if [[ -z "$account" ]]; then
-                print_error "Please specify an account"
-                echo "Usage: gitty ssh setup <account>"
-                exit 1
-            fi
-            
-            if [[ -z "${ACCOUNTS[$account]}" ]]; then
-                print_error "Account '$account' not found"
-                print_info "Available accounts: ${(k)ACCOUNTS}"
-                exit 1
-            fi
-            
-            # Parse account info
-            local IFS=":"
-            local info=(${=ACCOUNTS[$account]})
-            local email=$info[2]
-            local ssh_host=$info[3]
-            
-            print_info "Setting up SSH for account '$account'..."
-            
-            if generate_ssh_key "$account" "$email"; then
-                if [[ "$ssh_host" != "github.com" ]]; then
-                    setup_ssh_config "$account" "$ssh_host"
-                fi
-                copy_public_key "$account"
-            fi
-            ;;
-            
-        *)
-            print_header
-            echo -e "${CYAN}SSH Key Management:${NC}"
-            echo "  gitty ssh setup <account>     Complete SSH setup (generate + config + copy)"
-            echo "  gitty ssh generate <account>  Generate SSH key pair"
-            echo "  gitty ssh config <account>    Setup SSH config entry"
-            echo "  gitty ssh copy <account>      Copy public key to clipboard"
-            echo ""
-            echo -e "${CYAN}Examples:${NC}"
-            echo "  gitty ssh setup mycompany     # Complete setup"
-            echo "  gitty ssh generate personal   # Just generate keys"
-            echo "  gitty ssh copy work           # Copy public key"
-            ;;
-    esac
 }
 
 # Register new account function
@@ -342,35 +199,25 @@ register_account() {
     print_info "SSH Host: $ssh_host"
     echo ""
     
-    # Offer to set up SSH keys
-    echo -n "Would you like to generate SSH keys for this account? (Y/n): "
-    read -r ssh_response
-    
-    if [[ ! "$ssh_response" =~ ^[Nn]$ ]]; then
-        print_info "Setting up SSH keys..."
-        
-        if generate_ssh_key "$account" "$email"; then
-            if [[ "$ssh_host" != "github.com" ]]; then
-                setup_ssh_config "$account" "$ssh_host"
-            fi
-            copy_public_key "$account"
-            
-            print_info "SSH setup complete! Remember to add the public key to your GitHub account."
-        else
-            print_warning "SSH key generation failed, but account is registered"
-        fi
+    # Set up GitHub CLI authentication
+    echo -n "Set up GitHub CLI authentication for this account? (y/N): "
+    read -r setup_gh
+    if [[ "$setup_gh" =~ ^[Yy]$ ]]; then
+        setup_gh_auth "$account" "$email"
     else
-        if [[ "$ssh_host" != "github.com" ]]; then
-            print_warning "Don't forget to configure your SSH config (~/.ssh/config) for '$ssh_host'"
-            print_info "Example SSH config entry:"
-            echo ""
-            echo "Host $ssh_host"
-            echo "  HostName github.com"
-            echo "  User git"
-            echo "  IdentityFile ~/.ssh/id_ed25519_${account}"
-            echo ""
-        fi
-        print_info "You can run 'gitty ssh setup $account' later to generate SSH keys"
+        print_info "Skipped GitHub CLI setup. You can set it up later with: gh auth login"
+    fi
+    echo ""
+    
+    if [[ "$ssh_host" != "github.com" ]]; then
+        print_warning "Don't forget to configure your SSH config (~/.ssh/config) for '$ssh_host'"
+        print_info "Example SSH config entry:"
+        echo ""
+        echo "Host $ssh_host"
+        echo "  HostName github.com"
+        echo "  User git"
+        echo "  IdentityFile ~/.ssh/id_ed25519_${account}"
+        echo ""
     fi
 }
 
@@ -494,6 +341,34 @@ use_account() {
     print_info "Email: $email"
     print_info "SSH Host: $host"
     
+    # Handle GitHub CLI authentication if available
+    if check_gh_cli; then
+        if is_gh_authenticated "$account"; then
+            # Switch to this account if not already active
+            local current_user=$(gh api user --jq .login 2>/dev/null || echo "")
+            if [[ "$current_user" != "$account" ]]; then
+                print_info "Switching GitHub CLI to $account account..."
+                if gh auth switch --user "$account" 2>/dev/null; then
+                    print_success "GitHub CLI switched to $account"
+                else
+                    print_warning "Failed to switch GitHub CLI account"
+                    print_info "You may need to run: gh auth switch --user $account"
+                fi
+            else
+                print_info "GitHub CLI already using $account account"
+            fi
+        else
+            print_warning "GitHub CLI not authenticated for $account"
+            echo -n "Set up GitHub CLI authentication now? (y/N): "
+            read -r setup_auth
+            if [[ "$setup_auth" =~ ^[Yy]$ ]]; then
+                setup_gh_auth "$account" "$email"
+            else
+                print_info "You can set up GitHub CLI later with: gh auth login"
+            fi
+        fi
+    fi
+    
     # Store current account for connect command
     git config gitty.account "$account"
 }
@@ -524,11 +399,13 @@ connect_project() {
     local info=(${=ACCOUNTS[$current_account]})
     local host=$info[3]
     
-    # Determine the username for the remote URL
-    local username
+    # Determine the username for the remote URL (use account name as default)
+    local username="$current_account"
+    
+    # Special cases for known accounts
     if [[ "$current_account" == "futugora" ]]; then
         username="futugora"
-    else
+    elif [[ "$current_account" == "liperama-dev" ]]; then
         username="liperama-dev"
     fi
     
@@ -556,6 +433,23 @@ connect_project() {
     
     print_info "Remote URL: $remote_url"
     print_info "Account: $current_account"
+    
+    # Offer to create repository if GitHub CLI is available
+    if check_gh_cli && is_gh_authenticated "$current_account"; then
+        echo ""
+        echo -n "Create repository '$project_name' on GitHub? (y/N): "
+        read -r create_repo
+        if [[ "$create_repo" =~ ^[Yy]$ ]]; then
+            print_info "Creating repository on GitHub..."
+            if gh repo create "$project_name" --public --description "Repository created with gitty" 2>/dev/null; then
+                print_success "Repository created: https://github.com/$current_account/$project_name"
+                print_info "You can now push with: git push -u origin main"
+            else
+                print_warning "Repository creation failed or already exists"
+                print_info "You may need to create it manually at: https://github.com/new"
+            fi
+        fi
+    fi
 }
 
 # Status function
@@ -701,7 +595,6 @@ show_help() {
     echo "  gitty use <account>        Switch to account (registers new accounts automatically)"
     echo "  gitty update <account>     Update account information (name, email, SSH host)"
     echo "  gitty connect <project>    Connect to remote repository"
-    echo "  gitty ssh <action>         SSH key management (setup, generate, config, copy)"
     echo "  gitty uncommit            Undo last commit and unstage files"
     echo "  gitty status              Show current repository status"
     echo "  gitty help                Show this help message"
@@ -712,7 +605,6 @@ show_help() {
     echo "  gitty use futugora         # Switch to existing account"
     echo "  gitty use mycompany        # Register & switch to new account"
     echo "  gitty update liperama-dev  # Update account information"
-    echo "  gitty ssh setup mycompany  # Complete SSH setup for account"
     echo "  gitty connect landing-page"
     echo "  gitty uncommit"
     echo ""
@@ -723,18 +615,20 @@ show_help() {
     echo "  4. gitty connect <project-name>"
     echo "  5. git push -u origin main"
     echo ""
-    echo -e "${CYAN}SSH Commands:${NC}"
-    echo "  gitty ssh setup <account>     # Generate keys + config + copy to clipboard"
-    echo "  gitty ssh generate <account>  # Generate SSH key pair only"
-    echo "  gitty ssh config <account>    # Setup SSH config entry only"
-    echo "  gitty ssh copy <account>      # Copy public key to clipboard"
-    echo ""
     echo -e "${CYAN}Account Registration:${NC}"
     echo "  When you use 'gitty use <new_account>', you'll be prompted for:"
     echo "  • Display name (e.g., 'John Doe')"
     echo "  • Email address"
     echo "  • SSH host (github.com or custom alias)"
-    echo "  • SSH key generation (optional)"
+    echo "  • GitHub CLI authentication (optional)"
+    echo ""
+    echo -e "${CYAN}GitHub CLI Integration:${NC}"
+    echo "  If GitHub CLI (gh) is installed, gitty will:"
+    echo "  • Automatically switch GitHub CLI accounts when using 'gitty use'"
+    echo "  • Offer to authenticate new accounts during registration"
+    echo "  • Provide option to create repositories with 'gitty connect'"
+    echo "  • Install GitHub CLI with: brew install gh"
+    echo "  • SSH host (github.com or custom alias)"
     echo ""
     echo -e "${CYAN}SSH Setup for Multiple Accounts:${NC}"
     echo "  For best results, set up SSH host aliases in ~/.ssh/config:"
@@ -752,14 +646,8 @@ case "${1:-help}" in
     "use")
         use_account "$2"
         ;;
-    "update")
-        update_account "$2"
-        ;;
     "connect")
         connect_project "$2"
-        ;;
-    "ssh")
-        ssh_management "$2" "$3"
         ;;
     "uncommit")
         uncommit_last
